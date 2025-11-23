@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+
+# Build Artifacts
+*.zip
+
+# Generated Output
+*.dxf
+!sample.dxf
+!sample2.dxf
+
+# IDE Settings
+.vscode/
+.idea/
+sample2.pdf
