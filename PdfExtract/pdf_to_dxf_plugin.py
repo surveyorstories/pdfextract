@@ -36,10 +36,6 @@ class PdfToDxfPlugin:
         
         # Add to Menu
         self.iface.addPluginToMenu("Pdf Extract", self.action)
-        
-        # Check dependencies on startup
-        from . import dependencies
-        dependencies.install_deps(self.iface)
 
     def unload(self):
         if self.provider:

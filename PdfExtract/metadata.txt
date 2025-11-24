@@ -4,7 +4,7 @@ qgisMinimumVersion=3.0
 qgisMaximumVersion=4.99
 supportsQt6=True
 description=Converts PDF files to DXF, Shapefile, Geojson format using PyMuPDF and ezdxf.
-version= 1.0
+version= 1.1
 icon=images/icon.png
 author=Surveyor Stories
 email= surveyorstories@gmail.com
@@ -16,4 +16,5 @@ tags=cad,pdf,dxf,converter,pdf to dxf, pdf to Shapefile, pdf to Geojson
 category=Vector
 experimental=False
 deprecated=False
+plugin_dependencies= qpip
 changelog= <a href=https://github.com/surveyorstories/pdfextract/releases>Visit Releases page </a>
