@@ -16,4 +16,5 @@ tags=cad,pdf,dxf,converter,pdf to dxf, pdf to Shapefile, pdf to Geojson
 category=Vector
 experimental=False
 deprecated=False
+plugin_dependencies= qpip
 changelog= <a href=https://github.com/surveyorstories/pdfextract/releases>Visit Releases page </a>

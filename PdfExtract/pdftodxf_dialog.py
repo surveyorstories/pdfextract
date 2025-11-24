@@ -472,8 +472,9 @@ class PdfToVectorDialog(QDialog):
                 margin-right: 2px;
             }
             QTabBar::tab:selected {
-           
-                border-bottom: 2px solid #0078d4;
+            background-color: #0078d4;
+            color: white;
+        
             }
         """)
 
