@@ -27,7 +27,8 @@ from qgis.core import (
     QgsPointXY, Qgis, QgsLayerTreeGroup
 )
 from qgis.utils import iface
-import os, traceback
+import os
+import traceback
 
 try:
     import fitz  # PyMuPDF
@@ -42,30 +43,32 @@ except Exception:
 # =========================================================
 # DXF EXPORT HELPER (using ezdxf)
 # =========================================================
+
+
 def convert_pdf_page_to_dxf_direct(page, output_dxf_path):
     """Convert PDF page directly to DXF using ezdxf (better quality)."""
     if ezdxf is None:
         return False, "ezdxf not installed"
-    
+
     try:
         dxf = ezdxf.new()
         # Create layers
         dxf.layers.new(name='PDF_GEOMETRY', dxfattribs={'color': 7})
         dxf.layers.new(name='PDF_TEXT', dxfattribs={'color': 1})
-        
+
         msp = dxf.modelspace()
         page_height = page.rect.height
-        
+
         # 1. Extract Drawings
         paths = page.get_drawings()
-        
+
         for path in paths:
             for item in path.get("items", []):
                 try:
                     cmd = item[0]
                     if isinstance(cmd, bytes):
                         cmd = cmd.decode("utf-8", "ignore")
-                    
+
                     # LINE
                     if str(cmd).lower() == "l":
                         p1 = item[1]
@@ -75,15 +78,16 @@ def convert_pdf_page_to_dxf_direct(page, output_dxf_path):
                             (p2[0], page_height - p2[1]),
                             dxfattribs={'layer': 'PDF_GEOMETRY'}
                         )
-                    
+
                     # CURVE
                     elif str(cmd).lower() == "c":
                         control_points = []
                         for pt in item[1:]:
                             control_points.append((pt[0], page_height - pt[1]))
                         if len(control_points) >= 2:
-                            msp.add_spline(control_points, degree=3, dxfattribs={'layer': 'PDF_GEOMETRY'})
-                    
+                            msp.add_spline(control_points, degree=3, dxfattribs={
+                                           'layer': 'PDF_GEOMETRY'})
+
                     # RECTANGLE
                     elif str(cmd).lower() in ("re", "rect"):
                         rect = item[1]
@@ -94,17 +98,18 @@ def convert_pdf_page_to_dxf_direct(page, output_dxf_path):
                             (rect.x0, page_height - rect.y1),
                             (rect.x0, page_height - rect.y0)
                         ]
-                        msp.add_lwpolyline(points, dxfattribs={'layer': 'PDF_GEOMETRY'})
-                
+                        msp.add_lwpolyline(points, dxfattribs={
+                                           'layer': 'PDF_GEOMETRY'})
+
                 except Exception:
                     continue
-        
+
         # 2. Extract Text
         try:
             text_dict = page.get_text("dict")
         except Exception:
             text_dict = {}
-        
+
         for block in text_dict.get("blocks", []):
             if block.get("type") != 0:
                 continue
@@ -114,11 +119,11 @@ def convert_pdf_page_to_dxf_direct(page, output_dxf_path):
                         text = span.get("text", "").strip()
                         if not text:
                             continue
-                        
+
                         size = span.get("size", 10)
                         origin = span.get("origin", (0, 0))
                         insert_point = (origin[0], page_height - origin[1])
-                        
+
                         msp.add_mtext(
                             text,
                             dxfattribs={
@@ -130,25 +135,25 @@ def convert_pdf_page_to_dxf_direct(page, output_dxf_path):
                         )
                     except Exception:
                         continue
-        
+
         dxf.saveas(output_dxf_path)
         return True, None
-        
+
     except Exception as e:
         return False, str(e)
-
 
 
 # =========================================================
 # BACKGROUND TASK
 # =========================================================
 class PdfToVectorTask(QgsTask):
-    def __init__(self, pdf_path, out_dir, out_fmt, crs, canvas_extent,
+    def __init__(self, pdf_paths, out_dir, out_fmt, crs, canvas_extent,
                  page_from, page_to, include_geom, include_text,
                  load_outputs, dialog_ref=None):
 
         super().__init__("PDF → Vector Conversion", QgsTask.CanCancel)
-        self.pdf_path = pdf_path
+        self.pdf_paths = pdf_paths if isinstance(
+            pdf_paths, list) else [pdf_paths]
         self.out_dir = out_dir
         self.out_fmt = out_fmt
         self.crs = crs
@@ -164,69 +169,102 @@ class PdfToVectorTask(QgsTask):
         self.error = None
 
     def run(self):
-        """Runs in background thread."""
+        """Runs in background thread processing multiple files."""
         try:
-            doc = fitz.open(self.pdf_path)
-            total_pages = len(doc)
+            total_progress_steps = 0
+            files_to_process = []
 
-            start = max(1, self.page_from)
-            end = min(total_pages, self.page_to)
-
-            base = os.path.splitext(os.path.basename(self.pdf_path))[0]
-            os.makedirs(self.out_dir, exist_ok=True)
-
-            # Choose driver for geometry/text
-            for index, i in enumerate(range(start - 1, end)):
+            # 1. Pre-calculate total work for progress bar
+            for pdf_path in self.pdf_paths:
                 if self.isCanceled():
                     return False
+                try:
+                    doc = fitz.open(pdf_path)
+                    page_count = len(doc)
+                    files_to_process.append((pdf_path, doc, page_count))
 
-                page_num = i + 1
-                page = doc[i]
+                    start = max(1, self.page_from)
+                    end = min(page_count, self.page_to)
+                    cnt = max(0, end - start + 1)
+                    total_progress_steps += cnt
+                except:
+                    continue
 
-                # driver for intermediate files (DXF uses geojson intermediate)
-                if self.out_fmt == "shp":
-                    geom_ext, text_ext = ".shp", ".shp"
-                    driver = "ESRI Shapefile"
-                elif self.out_fmt == "geojson":
-                    geom_ext, text_ext = ".geojson", ".geojson"
-                    driver = "GeoJSON"
-                else:
-                    geom_ext, text_ext = ".geojson", ".geojson"
-                    driver = "GeoJSON"
+            if total_progress_steps == 0:
+                total_progress_steps = 1
 
-                geom_path = os.path.join(self.out_dir, f"{base}_p{page_num}_geom{geom_ext}")
-                text_path = os.path.join(self.out_dir, f"{base}_p{page_num}_text{text_ext}")
+            processed_steps = 0
+            os.makedirs(self.out_dir, exist_ok=True)
 
-                # DXF export - use direct ezdxf method if available
-                if self.out_fmt == "dxf":
-                    dxf_out = os.path.join(self.out_dir, f"{base}_p{page_num}.dxf")
-                    
-                    # Try ezdxf direct conversion (better quality)
-                    ok, msg = convert_pdf_page_to_dxf_direct(page, dxf_out)
-                    
-                    if ok:
-                        self.generated.append((dxf_out, f"{base} Page {page_num}", "dxf"))
+            # 2. Process each file
+            for pdf_path, doc, total_pages in files_to_process:
+                base = os.path.splitext(os.path.basename(pdf_path))[0]
+
+                start = max(1, self.page_from)
+                end = min(total_pages, self.page_to)
+
+                for i in range(start - 1, end):
+                    if self.isCanceled():
+                        doc.close()
+                        return False
+
+                    page_num = i + 1
+                    page = doc[i]
+
+                    # Determine extensions and driver
+                    if self.out_fmt == "shp":
+                        geom_ext, text_ext = ".shp", ".shp"
+                        driver = "ESRI Shapefile"
+                    elif self.out_fmt == "geojson":
+                        geom_ext, text_ext = ".geojson", ".geojson"
+                        driver = "GeoJSON"
                     else:
-                        QgsApplication.logMessage(f"ezdxf conversion failed: {msg}, using fallback", "PDF2Vector", Qgis.Warning)
-                        # Fallback: write intermediate files
+                        geom_ext, text_ext = ".geojson", ".geojson"
+                        driver = "GeoJSON"
+
+                    # Output paths
+                    geom_path = os.path.join(
+                        self.out_dir, f"{base}_p{page_num}_geom{geom_ext}")
+                    text_path = os.path.join(
+                        self.out_dir, f"{base}_p{page_num}_text{text_ext}")
+
+                    # DXF Export
+                    if self.out_fmt == "dxf":
+                        dxf_out = os.path.join(
+                            self.out_dir, f"{base}_p{page_num}.dxf")
+                        ok, msg = convert_pdf_page_to_dxf_direct(page, dxf_out)
+                        if ok:
+                            self.generated.append(
+                                (dxf_out, f"{base} Page {page_num}", "dxf"))
+                        else:
+                            QgsApplication.logMessage(
+                                f"ezdxf fail for {base} p{page}: {msg}", "PDF2Vector", Qgis.Warning)
+                            if self.include_geom:
+                                self._write_geometry(page, geom_path, driver)
+                                self.generated.append(
+                                    (geom_path, f"{base} Page {page_num} Geometry", "geom"))
+                            if self.include_text:
+                                self._write_text(page, text_path, driver)
+                                self.generated.append(
+                                    (text_path, f"{base} Page {page_num} Text", "text"))
+                    # SHP/GeoJSON Export
+                    else:
                         if self.include_geom:
                             self._write_geometry(page, geom_path, driver)
-                            self.generated.append((geom_path, f"{base} Page {page_num} Geometry", "geom"))
+                            self.generated.append(
+                                (geom_path, f"{base} Page {page_num} Geometry", "geom"))
                         if self.include_text:
                             self._write_text(page, text_path, driver)
-                            self.generated.append((text_path, f"{base} Page {page_num} Text", "text"))
-                else:
-                    # Write layers for shp/geojson
-                    if self.include_geom:
-                        self._write_geometry(page, geom_path, driver)
-                        self.generated.append((geom_path, f"{base} Page {page_num} Geometry", "geom"))
-                    if self.include_text:
-                        self._write_text(page, text_path, driver)
-                        self.generated.append((text_path, f"{base} Page {page_num} Text", "text"))
+                            self.generated.append(
+                                (text_path, f"{base} Page {page_num} Text", "text"))
 
-                # update progress
-                percent = int(((index + 1) / (end - start + 1)) * 100)
-                self.setProgress(percent)
+                    # Update progress
+                    processed_steps += 1
+                    percent = int(
+                        (processed_steps / total_progress_steps) * 100)
+                    self.setProgress(percent)
+
+                doc.close()
 
             return True
 
@@ -235,10 +273,10 @@ class PdfToVectorTask(QgsTask):
             traceback.print_exc()
             return False
 
-
     # -----------------------------------------------
     # GEOMETRY WRITER
     # -----------------------------------------------
+
     def _write_geometry(self, page, out_path, driver):
         fields = QgsFields()
         fields.append(QgsField("id", QVariant.Int))
@@ -276,7 +314,8 @@ class PdfToVectorTask(QgsTask):
 
                     # LINE
                     if str(cmd).lower() == "l":
-                        p1 = item[1]; p2 = item[2]
+                        p1 = item[1]
+                        p2 = item[2]
                         x1, y1 = p1[0] + ox, page_h - p1[1] + oy
                         x2, y2 = p2[0] + ox, page_h - p2[1] + oy
                         geom = QgsGeometry.fromPolylineXY([
@@ -325,10 +364,10 @@ class PdfToVectorTask(QgsTask):
 
         del writer
 
-
     # -----------------------------------------------
     # TEXT WRITER
     # -----------------------------------------------
+
     def _write_text(self, page, out_path, driver):
         fields = QgsFields()
         fields.append(QgsField("id", QVariant.Int))
@@ -378,7 +417,8 @@ class PdfToVectorTask(QgsTask):
                         feat.setAttribute("text", txt)
                         feat.setAttribute("size", float(span.get("size", 0.0)))
                         feat.setAttribute("font", span.get("font", "Unknown"))
-                        feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(x, y)))
+                        feat.setGeometry(
+                            QgsGeometry.fromPointXY(QgsPointXY(x, y)))
                         writer.addFeature(feat)
                         fid += 1
                     except Exception:
@@ -386,10 +426,10 @@ class PdfToVectorTask(QgsTask):
 
         del writer
 
-
     # -----------------------------------------------
     # TASK FINISHED (MAIN THREAD)
     # -----------------------------------------------
+
     def finished(self, result):
         """Called in MAIN thread."""
         if self.error:
@@ -400,40 +440,44 @@ class PdfToVectorTask(QgsTask):
 
         loaded = 0
         prj = QgsProject.instance()
-        
-        # Create a group if multiple files
+
+        # Create a group if multiple files or multiple output layers
         group = None
         if len(self.generated) > 1 and self.load_outputs:
-            base_name = os.path.splitext(os.path.basename(self.pdf_path))[0]
-            group_name = f"PDF_{base_name}"
-            
+            if len(self.pdf_paths) == 1:
+                base_name = os.path.splitext(
+                    os.path.basename(self.pdf_paths[0]))[0]
+                group_name = f"PDF_{base_name}"
+            else:
+                group_name = "PDF_Batch_Import"
+
             root = prj.layerTreeRoot()
             group = root.insertGroup(0, group_name)
 
         for path, name, typ in self.generated:
-            if not os.path.exists(path): 
+            if not os.path.exists(path):
                 continue
-            if not self.load_outputs: 
+            if not self.load_outputs:
                 continue
 
             lyr = QgsVectorLayer(path, name, "ogr")
             if lyr.isValid():
-                prj.addMapLayer(lyr, False)  # Add without showing in legend yet
-                
+                # Add without showing in legend yet
+                prj.addMapLayer(lyr, False)
+
                 if group:
                     group.addLayer(lyr)
                 else:
                     # If only one layer, add normally
                     prj.layerTreeRoot().addLayer(lyr)
-                
+
                 loaded += 1
 
         iface.messageBar().pushSuccess("PDF→Vector",
-            f"Conversion completed. {loaded} layers loaded.")
+                                       f"Conversion completed. {loaded} layers loaded.")
 
         if self.dialog_ref:
             self.dialog_ref.on_task_finished(True, f"{loaded} layers loaded.")
-
 
 
 # =========================================================
@@ -459,13 +503,13 @@ class PdfToVectorDialog(QDialog):
         main = QVBoxLayout()
         main.setSpacing(12)
         main.setContentsMargins(12, 12, 12, 12)
-        
+
         tabs = QTabWidget()
         tabs.setStyleSheet("""
             QTabWidget::pane {
                 border: 1px solid #c0c0c0;
                 border-radius: 4px;
-             
+
             }
             QTabBar::tab {
                 padding: 8px 20px;
@@ -474,7 +518,7 @@ class PdfToVectorDialog(QDialog):
             QTabBar::tab:selected {
             background-color: #0078d4;
             color: white;
-        
+
             }
         """)
 
@@ -490,11 +534,11 @@ class PdfToVectorDialog(QDialog):
         grp_io = QGroupBox("Input / Output")
         grp_io_layout = QVBoxLayout()
         grp_io_layout.setSpacing(8)
-        
+
         grp_io_layout.addWidget(QLabel("PDF File:"))
         row_pdf = QHBoxLayout()
         self.pdf_edit = QLineEdit()
-        self.pdf_edit.setPlaceholderText("Select a PDF file...")
+        self.pdf_edit.setPlaceholderText("Select PDF file(s)...")
         btn_pdf = QPushButton("Browse...")
         btn_pdf.setMinimumWidth(100)
         btn_pdf.clicked.connect(self._pick_pdf)
@@ -517,9 +561,10 @@ class PdfToVectorDialog(QDialog):
         grp_io_layout.addSpacing(4)
         grp_io_layout.addWidget(QLabel("Output Format:"))
         self.format_combo = QComboBox()
-        self.format_combo.addItems(["Shapefile (.shp)", "GeoJSON (.geojson)", "DXF (.dxf)"])
+        self.format_combo.addItems(
+            ["Shapefile (.shp)", "GeoJSON (.geojson)", "DXF (.dxf)"])
         grp_io_layout.addWidget(self.format_combo)
-        
+
         grp_io.setLayout(grp_io_layout)
         layout_in.addWidget(grp_io)
 
@@ -527,11 +572,11 @@ class PdfToVectorDialog(QDialog):
         grp_options = QGroupBox("Options")
         grp_options_layout = QVBoxLayout()
         grp_options_layout.setSpacing(6)
-        
+
         self.chk_load = QCheckBox("Load results into QGIS project")
         self.chk_load.setChecked(True)
         grp_options_layout.addWidget(self.chk_load)
-        
+
         grp_options.setLayout(grp_options_layout)
         layout_in.addWidget(grp_options)
 
@@ -556,17 +601,22 @@ class PdfToVectorDialog(QDialog):
         self.chk_range_all.setChecked(True)
         self.chk_range_all.stateChanged.connect(self._toggle_range)
 
-        self.spin_from = QSpinBox(); self.spin_from.setMinimum(1)
+        self.spin_from = QSpinBox()
+        self.spin_from.setMinimum(1)
         self.spin_from.setMinimumWidth(80)
-        self.spin_to = QSpinBox(); self.spin_to.setMinimum(1)
+        self.spin_to = QSpinBox()
+        self.spin_to.setMinimum(1)
         self.spin_to.setMinimumWidth(80)
-        self.spin_from.setEnabled(False); self.spin_to.setEnabled(False)
+        self.spin_from.setEnabled(False)
+        self.spin_to.setEnabled(False)
 
         frm.addRow(self.chk_range_all)
         hr = QHBoxLayout()
         hr.setSpacing(10)
-        hr.addWidget(QLabel("From:")); hr.addWidget(self.spin_from)
-        hr.addWidget(QLabel("To:"));   hr.addWidget(self.spin_to)
+        hr.addWidget(QLabel("From:"))
+        hr.addWidget(self.spin_from)
+        hr.addWidget(QLabel("To:"))
+        hr.addWidget(self.spin_to)
         hr.addStretch()
         frm.addRow(hr)
         grp_range.setLayout(frm)
@@ -610,10 +660,10 @@ class PdfToVectorDialog(QDialog):
                 border-radius: 2px;
             }
         """)
-        
+
         self.lbl_prog = QLabel("Ready")
         self.lbl_prog.setStyleSheet("color: #666666; font-size: 11px;")
-        
+
         pb_row.addWidget(self.progress)
         pb_row.addWidget(self.lbl_prog)
         main.addLayout(pb_row)
@@ -643,18 +693,18 @@ class PdfToVectorDialog(QDialog):
             }
         """)
         self.btn_convert.clicked.connect(self.start)
-        
+
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setMinimumWidth(100)
         self.btn_cancel.setMinimumHeight(32)
         self.btn_cancel.clicked.connect(self._cancel)
         self.btn_cancel.setEnabled(False)
-        
+
         self.btn_close = QPushButton("Close")
         self.btn_close.setMinimumWidth(100)
         self.btn_close.setMinimumHeight(32)
         self.btn_close.clicked.connect(self.close)
-        
+
         btn_row.addWidget(self.btn_convert)
         btn_row.addWidget(self.btn_cancel)
         btn_row.addStretch()
@@ -667,20 +717,44 @@ class PdfToVectorDialog(QDialog):
     # UI callbacks
     # ----------------------------------------------------
     def _pick_pdf(self):
-        # Qt5/Qt6 compatible file dialog
-        result = QFileDialog.getOpenFileName(self, "Select PDF", "", "PDF (*.pdf)")
-        # In Qt5 it returns (filename, filter), in Qt6 same
-        f = result[0] if isinstance(result, tuple) else result
-        if f:
-            self.pdf_edit.setText(f)
-            try:
-                doc = fitz.open(f)
-                n = len(doc)
-                self.spin_from.setMaximum(n)
-                self.spin_to.setMaximum(n)
-                self.spin_to.setValue(n)
-            except:
-                pass
+        # Use instance-based dialog to ensure multiple selection works reliably across bindings
+        dlg = QFileDialog(self, "Select PDF(s)")
+        try:
+            # Qt5
+            mode = QFileDialog.ExistingFiles
+        except AttributeError:
+            # Qt6
+            mode = QFileDialog.FileMode.ExistingFiles
+        dlg.setFileMode(mode)
+        dlg.setNameFilter("PDF (*.pdf)")
+
+        exec_func = dlg.exec if hasattr(dlg, 'exec') else dlg.exec_
+
+        # Qt5/Qt6 compatible Accepted constant
+        try:
+            accepted = QDialog.Accepted
+        except AttributeError:
+            accepted = QDialog.DialogCode.Accepted
+
+        if exec_func() == accepted:
+            files = dlg.selectedFiles()
+
+            if files:
+                # Join with semicolon for display
+                joined_paths = "; ".join(files)
+                self.pdf_edit.setText(joined_paths)
+
+                # Use the first file to set page counts
+                try:
+                    if len(files) > 0:
+                        doc = fitz.open(files[0])
+                        n = len(doc)
+                        self.spin_from.setMaximum(n)
+                        self.spin_to.setMaximum(n)
+                        self.spin_to.setValue(n)
+                        doc.close()
+                except:
+                    pass
 
     def _pick_out(self):
         # Qt5/Qt6 compatible directory dialog
@@ -703,28 +777,48 @@ class PdfToVectorDialog(QDialog):
     # START TASK
     # ----------------------------------------------------
     def start(self):
-        pdf = self.pdf_edit.text().strip()
+        pdf_input = self.pdf_edit.text().strip()
         out = self.out_edit.text().strip()
-        if not os.path.exists(pdf):
-            QMessageBox.warning(self, "Error", "Invalid PDF")
+
+        # Split by semicolon to get all files
+        pdf_files = [f.strip() for f in pdf_input.split(";") if f.strip()]
+
+        if not pdf_files:
+            QMessageBox.warning(self, "Error", "No PDF files selected")
             return
+
+        for pdf in pdf_files:
+            if not os.path.exists(pdf):
+                QMessageBox.warning(self, "Error", f"Invalid PDF path: {pdf}")
+                return
+
         if not out:
             QMessageBox.warning(self, "Error", "Select output folder")
             return
 
+        # Check first file for page count
         try:
-            doc = fitz.open(pdf)
-            pages = len(doc)
+            doc = fitz.open(pdf_files[0])
+            first_pages = len(doc)
+            doc.close()
         except Exception as e:
             QMessageBox.warning(self, "Error opening PDF", str(e))
             return
 
         if self.chk_range_all.isChecked():
-            p_from, p_to = 1, pages
+            p_from, p_to = 1, 9999999
         else:
             p_from = self.spin_from.value()
             p_to = self.spin_to.value()
-            if p_from < 1 or p_to < p_from or p_to > pages:
+
+            # Use stricter check only if single file
+            if len(pdf_files) == 1:
+                if p_to > first_pages:
+                    QMessageBox.warning(
+                        self, "Error", "Page range exceeds PDF page count")
+                    return
+
+            if p_from < 1 or p_to < p_from:
                 QMessageBox.warning(self, "Error", "Invalid page range")
                 return
 
@@ -749,7 +843,7 @@ class PdfToVectorDialog(QDialog):
             cext = None
 
         self.task = PdfToVectorTask(
-            pdf, out, out_fmt, crs, cext,
+            pdf_files, out, out_fmt, crs, cext,
             page_from=p_from, page_to=p_to,
             include_geom=self.chk_geom.isChecked(),
             include_text=self.chk_text.isChecked(),
@@ -773,7 +867,7 @@ class PdfToVectorDialog(QDialog):
     # ----------------------------------------------------
     # SAFE PROGRESS UPDATE (patched)
     # ----------------------------------------------------
-    
+
     def _update_progress_safe(self):
         """Safely update progress without touching deleted QObject."""
         if self.task is None:
@@ -838,7 +932,6 @@ class PdfToVectorDialog(QDialog):
             self.lbl_prog.setText("Ready")
         else:
             QMessageBox.critical(self, "Error", message)
-
 
 
 # =========================================================
