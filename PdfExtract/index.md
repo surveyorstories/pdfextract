@@ -13,6 +13,7 @@ import PdfToDxfDownloadButton from "@site/src/components/PdfToDxfDownloadButton"
 ## ✨ Features
 
 - **Vector Conversion**: Converts PDF vector graphics (lines, curves, polygons) into editable vector formats including DXF, Shapefile, and GeoJSON.
+- **Crop Region Selection**: Interactively select a rectangular region on the PDF preview to extract only the content within that area. Perfect for isolating specific sections of large drawings.
 - **Batch Processing**: Select and convert multiple PDF files simultaneously. Each file is processed sequentially, and results are grouped for easy management.
 - **Text Extraction**: Extracts text from PDF files and converts them into DXF `MTEXT` entities or vector text layers in Shapefile/GeoJSON, preserving position and size.
 - **Layer Separation**: Automatically organizes output into distinct layers or files:
@@ -92,9 +93,17 @@ The plugin relies on two Python libraries, which are **automatically installed**
     - Select the output format from the dropdown: Shapefile (.shp), GeoJSON (.geojson), or DXF (.dxf).
     - Optionally, check **Load results into QGIS** to load outputs automatically.
 
-3. In the **Advanced** tab:
-    - Choose to process **All pages** or specify a **Page Range** by entering the start and end page numbers. Selecting a page range allows you to convert only specific pages from the PDF.
-    - Select the content to extract:
+3. Configure extraction options:
+    - **Crop Region (Optional)**: Click **"Set Crop Region..."** to interactively select a specific area:
+      - A preview dialog opens showing the first page of the PDF.
+      - Click and drag with the crosshair cursor to draw a rectangular selection.
+      - Click **"OK"** to confirm or **"Clear Selection"** to reset.
+      - The crop region applies to **all pages** being processed.
+      - Only geometry and text **fully contained** within the crop region will be extracted.
+      - Status label shows crop coordinates or "Full Page" if no crop is set.
+    - **Page Range**: Navigate to the **Advanced** tab:
+      - Choose to process **All pages** or specify a **Page Range** by entering the start and end page numbers. Selecting a page range allows you to convert only specific pages from the PDF.
+    - **Content Selection**: Select what to extract:
       - **Geometry**: Extracts vector shapes such as lines, curves, and rectangles from the PDF.
       - **Text**: Extracts text elements including labels and annotations.
       - **Both**: Extracts both geometry and text for comprehensive conversion.
@@ -103,6 +112,13 @@ The plugin relies on two Python libraries, which are **automatically installed**
     - The progress bar displays the status of the batch operation.
     - A confirmation message appears upon completion showing how many layers were loaded across all files.
     - If multiple files were processed, loaded layers are grouped under a "PDF_Batch_Import" group in the Layers panel.
+
+### 📐 Crop Region Tips
+
+- **Isolate Sections**: Use crop region to extract only a specific area of interest, such as a detail from a large plan drawing.
+- **Remove Borders**: Crop out title blocks, legends, or page borders by selecting only the main drawing area.
+- **Multi-page Consistency**: The selected crop region from the first page preview is applied to all pages in the batch.
+- **Containment Filter**: Only objects **completely inside** the crop region are extracted. Objects that extend beyond the boundary are excluded.
 
 ### ⚙️ Running the Algorithm Directly
 

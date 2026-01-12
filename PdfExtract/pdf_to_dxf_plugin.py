@@ -9,6 +9,7 @@ from qgis.utils import iface
 from .pdf_to_dxf_provider import PdfToDxfProvider
 from .pdftodxf_dialog import PdfToVectorDialog
 
+
 class PdfToDxfPlugin:
     def __init__(self, iface):
         self.iface = iface
@@ -21,37 +22,47 @@ class PdfToDxfPlugin:
     def initGui(self):
         self.provider = PdfToDxfProvider()
         QgsApplication.processingRegistry().addProvider(self.provider)
-        
+
         # Create Action
         icon_path = os.path.join(self.plugin_dir, 'images', 'icon.png')
-        self.action = QAction(QIcon(icon_path), "PDF Extract", self.iface.mainWindow())
+        self.action = QAction(
+            QIcon(icon_path), "PDF Extract", self.iface.mainWindow())
         self.action.setObjectName("PdfToDxfConverterAction")
         self.action.setToolTip("Convert PDF to DXF/Shapefile/GeoJSON")
         self.action.triggered.connect(self.run)
-        
+
         # Create dedicated Toolbar
         self.toolbar = self.iface.addToolBar("PDF Extract")
         self.toolbar.setObjectName("Pdf Extract Toolbar")
         self.toolbar.addAction(self.action)
-        
+
         # Add to Menu
         self.iface.addPluginToMenu("Pdf Extract", self.action)
 
     def unload(self):
+        # Close dialog if it's open
+        if self.dlg:
+            try:
+                self.dlg.close()
+                self.dlg.deleteLater()
+            except RuntimeError:
+                pass
+            self.dlg = None
+
         if self.provider:
             try:
                 QgsApplication.processingRegistry().removeProvider(self.provider)
             except RuntimeError:
                 pass
             self.provider = None
-            
+
         if self.action:
             self.iface.removePluginMenu("Pdf Extract", self.action)
             if self.toolbar:
                 self.toolbar.removeAction(self.action)
                 del self.toolbar
                 self.toolbar = None
-            
+
             try:
                 self.action.deleteLater()
             except RuntimeError:
@@ -61,10 +72,9 @@ class PdfToDxfPlugin:
     def run(self):
         if not self.dlg:
             self.dlg = PdfToVectorDialog(iface)
-        
+
         self.dlg.show()
         if hasattr(self.dlg, 'exec'):
             result = self.dlg.exec()
         else:
             result = self.dlg.exec_()
-

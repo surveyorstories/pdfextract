@@ -17,9 +17,10 @@ from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QFileDialog, QComboBox, QMessageBox, QTabWidget,
     QWidget, QCheckBox, QSpinBox, QGroupBox, QFormLayout, QProgressBar,
-    QFrame
+    QFrame, QScrollArea
 )
-from qgis.PyQt.QtCore import Qt, QTimer, QVariant
+from qgis.PyQt.QtCore import Qt, QTimer, QVariant, QRect, QPoint
+from qgis.PyQt.QtGui import QPixmap, QImage, QPainter, QPen, QColor
 from qgis.core import (
     QgsTask, QgsApplication, QgsProject,
     QgsVectorLayer, QgsVectorFileWriter, QgsFields, QgsField,
@@ -45,7 +46,70 @@ except Exception:
 # =========================================================
 
 
-def convert_pdf_page_to_dxf_direct(page, output_dxf_path):
+def clip_line_to_rect(x1, y1, x2, y2, rect):
+    """
+    Clip a line segment to a rectangle using Cohen-Sutherland algorithm.
+    Returns (clipped_x1, clipped_y1, clipped_x2, clipped_y2) or None if line is completely outside.
+    """
+    # Define region codes
+    INSIDE = 0  # 0000
+    LEFT = 1    # 0001
+    RIGHT = 2   # 0010
+    BOTTOM = 4  # 0100
+    TOP = 8     # 1000
+
+    def compute_code(x, y):
+        code = INSIDE
+        if x < rect.x0:
+            code |= LEFT
+        elif x > rect.x1:
+            code |= RIGHT
+        if y < rect.y0:
+            code |= BOTTOM
+        elif y > rect.y1:
+            code |= TOP
+        return code
+
+    code1 = compute_code(x1, y1)
+    code2 = compute_code(x2, y2)
+
+    while True:
+        # Both endpoints inside - accept
+        if code1 == 0 and code2 == 0:
+            return (x1, y1, x2, y2)
+
+        # Both endpoints share an outside region - reject
+        if code1 & code2:
+            return None
+
+        # Line needs clipping
+        # Pick an endpoint that is outside
+        code_out = code1 if code1 != 0 else code2
+
+        # Find intersection point
+        if code_out & TOP:
+            x = x1 + (x2 - x1) * (rect.y1 - y1) / (y2 - y1)
+            y = rect.y1
+        elif code_out & BOTTOM:
+            x = x1 + (x2 - x1) * (rect.y0 - y1) / (y2 - y1)
+            y = rect.y0
+        elif code_out & RIGHT:
+            y = y1 + (y2 - y1) * (rect.x1 - x1) / (x2 - x1)
+            x = rect.x1
+        elif code_out & LEFT:
+            y = y1 + (y2 - y1) * (rect.x0 - x1) / (x2 - x1)
+            x = rect.x0
+
+        # Replace the outside point with the intersection
+        if code_out == code1:
+            x1, y1 = x, y
+            code1 = compute_code(x1, y1)
+        else:
+            x2, y2 = x, y
+            code2 = compute_code(x2, y2)
+
+
+def convert_pdf_page_to_dxf_direct(page, output_dxf_path, crop_rect=None):
     """Convert PDF page directly to DXF using ezdxf (better quality)."""
     if ezdxf is None:
         return False, "ezdxf not installed"
@@ -63,6 +127,15 @@ def convert_pdf_page_to_dxf_direct(page, output_dxf_path):
         paths = page.get_drawings()
 
         for path in paths:
+            # Check if path intersects with crop region (not full containment)
+            if crop_rect:
+                path_rect = path.get("rect")
+                if path_rect:
+                    # Check if path intersects the crop region
+                    if not (path_rect.x0 <= crop_rect.x1 and path_rect.x1 >= crop_rect.x0 and
+                            path_rect.y0 <= crop_rect.y1 and path_rect.y1 >= crop_rect.y0):
+                        continue  # Skip paths that don't intersect crop region
+
             for item in path.get("items", []):
                 try:
                     cmd = item[0]
@@ -73,15 +146,42 @@ def convert_pdf_page_to_dxf_direct(page, output_dxf_path):
                     if str(cmd).lower() == "l":
                         p1 = item[1]
                         p2 = item[2]
-                        msp.add_line(
-                            (p1[0], page_height - p1[1]),
-                            (p2[0], page_height - p2[1]),
-                            dxfattribs={'layer': 'PDF_GEOMETRY'}
-                        )
+
+                        # Clip line to crop region if needed
+                        if crop_rect:
+                            clipped = clip_line_to_rect(
+                                p1[0], p1[1], p2[0], p2[1], crop_rect)
+                            if clipped is None:
+                                continue  # Line is completely outside crop region
+
+                            x1, y1, x2, y2 = clipped
+                            msp.add_line(
+                                (x1, page_height - y1),
+                                (x2, page_height - y2),
+                                dxfattribs={'layer': 'PDF_GEOMETRY'}
+                            )
+                        else:
+                            msp.add_line(
+                                (p1[0], page_height - p1[1]),
+                                (p2[0], page_height - p2[1]),
+                                dxfattribs={'layer': 'PDF_GEOMETRY'}
+                            )
 
                     # CURVE
                     elif str(cmd).lower() == "c":
                         control_points = []
+                        # For curves, check if all points are within crop region
+                        all_inside = True
+                        for pt in item[1:]:
+                            if crop_rect:
+                                if not (crop_rect.x0 <= pt[0] <= crop_rect.x1 and
+                                        crop_rect.y0 <= pt[1] <= crop_rect.y1):
+                                    all_inside = False
+                                    break
+
+                        if not all_inside and crop_rect:
+                            continue  # Skip curves that extend outside crop region
+
                         for pt in item[1:]:
                             control_points.append((pt[0], page_height - pt[1]))
                         if len(control_points) >= 2:
@@ -91,12 +191,21 @@ def convert_pdf_page_to_dxf_direct(page, output_dxf_path):
                     # RECTANGLE
                     elif str(cmd).lower() in ("re", "rect"):
                         rect = item[1]
+
+                        if crop_rect:
+                            # For rectangles, check if fully contained within crop
+                            if not (rect.x0 >= crop_rect.x0 and rect.x1 <= crop_rect.x1 and
+                                    rect.y0 >= crop_rect.y0 and rect.y1 <= crop_rect.y1):
+                                continue  # Skip rectangles not fully within crop
+
+                        x0, y0, x1, y1 = rect.x0, rect.y0, rect.x1, rect.y1
+
                         points = [
-                            (rect.x0, page_height - rect.y0),
-                            (rect.x1, page_height - rect.y0),
-                            (rect.x1, page_height - rect.y1),
-                            (rect.x0, page_height - rect.y1),
-                            (rect.x0, page_height - rect.y0)
+                            (x0, page_height - y0),
+                            (x1, page_height - y0),
+                            (x1, page_height - y1),
+                            (x0, page_height - y1),
+                            (x0, page_height - y0)
                         ]
                         msp.add_lwpolyline(points, dxfattribs={
                                            'layer': 'PDF_GEOMETRY'})
@@ -106,7 +215,11 @@ def convert_pdf_page_to_dxf_direct(page, output_dxf_path):
 
         # 2. Extract Text
         try:
-            text_dict = page.get_text("dict")
+            if crop_rect:
+                # Use clip parameter to extract only text in crop region
+                text_dict = page.get_text("dict", clip=crop_rect)
+            else:
+                text_dict = page.get_text("dict")
         except Exception:
             text_dict = {}
 
@@ -144,12 +257,501 @@ def convert_pdf_page_to_dxf_direct(page, output_dxf_path):
 
 
 # =========================================================
+# CROP PREVIEW DIALOG
+# =========================================================
+class CropPreviewDialog(QDialog):
+    """Dialog for selecting a crop region on a PDF page preview."""
+
+    def __init__(self, pdf_path, existing_crop_rect=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Crop Region")
+        self.setMinimumSize(800, 600)
+
+        self.pdf_path = pdf_path
+        self.crop_rect = existing_crop_rect  # Will be a fitz.Rect in PDF coordinates
+        self.page_rect = None  # Full page rect
+
+        # Selection state
+        self.selecting = False
+        self.start_point = None
+        self.current_point = None
+
+        # Display scaling and zoom
+        self.base_scale_factor = 1.0  # Base scale from PDF to rendered image
+        self.zoom_level = 1.0  # Current zoom multiplier (1.0 = 100%)
+        self.offset_x = 0
+        self.offset_y = 0
+
+        # Store the original rendered pixmap
+        self.original_pixmap = None
+        self.base_pixmap = None  # Zoomed version
+
+        # Page navigation
+        self.current_page = 0  # 0-indexed
+        self.total_pages = 0
+
+        self._build_ui()
+        self._load_pdf_preview()
+
+    def _build_ui(self):
+        layout = QVBoxLayout()
+
+        # Scroll area for the image (no instruction label to prevent scroll)
+        scroll = QScrollArea()
+        # Fixed size to avoid coordinate issues
+        scroll.setWidgetResizable(False)
+
+        # Image label (will draw the PDF and selection)
+        self.image_label = QLabel()
+        self.image_label.setMouseTracking(True)
+        self.image_label.setScaledContents(False)
+
+        # Set crosshair cursor
+        try:
+            # Qt6
+            self.image_label.setCursor(Qt.CursorShape.CrossCursor)
+        except AttributeError:
+            # Qt5
+            self.image_label.setCursor(Qt.CrossCursor)
+
+        self.image_label.mousePressEvent = self._on_mouse_press
+        self.image_label.mouseMoveEvent = self._on_mouse_move
+        self.image_label.mouseReleaseEvent = self._on_mouse_release
+        scroll.setWidget(self.image_label)
+
+        layout.addWidget(scroll)
+
+        # Page navigation controls
+        page_row = QHBoxLayout()
+        page_row.addWidget(QLabel("Page:"))
+
+        self.btn_prev_page = QPushButton("◀")
+        self.btn_prev_page.setMaximumWidth(40)
+        self.btn_prev_page.setToolTip("Previous Page")
+        self.btn_prev_page.clicked.connect(self._prev_page)
+
+        self.lbl_page = QLabel("1 / 1")
+        try:
+            self.lbl_page.setAlignment(Qt.AlignCenter)
+        except AttributeError:
+            self.lbl_page.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_page.setMinimumWidth(80)
+
+        self.btn_next_page = QPushButton("▶")
+        self.btn_next_page.setMaximumWidth(40)
+        self.btn_next_page.setToolTip("Next Page")
+        self.btn_next_page.clicked.connect(self._next_page)
+
+        page_row.addWidget(self.btn_prev_page)
+        page_row.addWidget(self.lbl_page)
+        page_row.addWidget(self.btn_next_page)
+        page_row.addSpacing(20)
+
+        # Zoom controls
+        zoom_row = QHBoxLayout()
+        zoom_row.addWidget(QLabel("Zoom:"))
+
+        btn_zoom_out = QPushButton("-")
+        btn_zoom_out.setMaximumWidth(40)
+        btn_zoom_out.setToolTip("Zoom Out")
+        btn_zoom_out.clicked.connect(self._zoom_out)
+
+        self.lbl_zoom = QLabel("100%")
+        try:
+            self.lbl_zoom.setAlignment(Qt.AlignCenter)
+        except AttributeError:
+            self.lbl_zoom.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_zoom.setMinimumWidth(60)
+
+        btn_zoom_in = QPushButton("+")
+        btn_zoom_in.setMaximumWidth(40)
+        btn_zoom_in.setToolTip("Zoom In")
+        btn_zoom_in.clicked.connect(self._zoom_in)
+
+        btn_zoom_fit = QPushButton("Fit")
+        btn_zoom_fit.setMaximumWidth(60)
+        btn_zoom_fit.setToolTip("Fit to Window")
+        btn_zoom_fit.clicked.connect(self._zoom_fit)
+
+        zoom_row.addWidget(btn_zoom_out)
+        zoom_row.addWidget(self.lbl_zoom)
+        zoom_row.addWidget(btn_zoom_in)
+        zoom_row.addWidget(btn_zoom_fit)
+        zoom_row.addStretch()
+
+        # Combine page and zoom controls in one row
+        controls_row = QHBoxLayout()
+        controls_row.addLayout(page_row)
+        controls_row.addLayout(zoom_row)
+
+        layout.addLayout(controls_row)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        btn_clear = QPushButton("Clear Selection")
+        btn_clear.clicked.connect(self._clear_selection)
+        btn_ok = QPushButton("OK")
+        btn_ok.setDefault(True)
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+
+        btn_row.addWidget(btn_clear)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_ok)
+        btn_row.addWidget(btn_cancel)
+
+        layout.addLayout(btn_row)
+        self.setLayout(layout)
+
+    def _load_pdf_preview(self, page_num=None):
+        """Load specified page of PDF as an image, scaled to fit window."""
+        if fitz is None:
+            QMessageBox.warning(self, "Error", "PyMuPDF not available")
+            self.reject()
+            return
+
+        try:
+            doc = fitz.open(self.pdf_path)
+            if len(doc) == 0:
+                QMessageBox.warning(self, "Error", "PDF has no pages")
+                self.reject()
+                return
+
+            # Track total pages
+            self.total_pages = len(doc)
+
+            # Use specified page or current_page
+            if page_num is not None:
+                self.current_page = max(0, min(page_num, self.total_pages - 1))
+
+            # Update page label and button states
+            if hasattr(self, 'lbl_page'):
+                self.lbl_page.setText(
+                    f"{self.current_page + 1} / {self.total_pages}")
+            if hasattr(self, 'btn_prev_page'):
+                self.btn_prev_page.setEnabled(self.current_page > 0)
+            if hasattr(self, 'btn_next_page'):
+                self.btn_next_page.setEnabled(
+                    self.current_page < self.total_pages - 1)
+
+            page = doc[self.current_page]
+            self.page_rect = page.rect
+
+            # Calculate scale to fit within dialog (accounting for UI elements)
+            # Target size: dialog minus padding and buttons (~700x500 usable area)
+            # Target size: dialog minus padding, zoom controls (~40px), and buttons (~50px)
+
+            target_width = 700
+            target_height = 450
+
+            # Calculate aspect-preserving scale
+            scale_w = target_width / self.page_rect.width
+            scale_h = target_height / self.page_rect.height
+            scale = min(scale_w, scale_h)
+
+            # Render at 2x resolution for better quality (high-DPI rendering)
+            # This creates a sharper image that we'll scale down smoothly
+            render_scale = scale * 2.0
+            mat = fitz.Matrix(render_scale, render_scale)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+
+            # Convert to QImage with Qt5/Qt6 compatibility
+            try:
+                # Qt5
+                img_format = QImage.Format_RGB888 if pix.n == 3 else QImage.Format_RGBA8888
+            except AttributeError:
+                # Qt6
+                img_format = QImage.Format.Format_RGB888 if pix.n == 3 else QImage.Format.Format_RGBA8888
+
+            qimg = QImage(pix.samples, pix.width,
+                          pix.height, pix.stride, img_format)
+
+            # Create high-res pixmap and scale down smoothly for display
+            high_res_pixmap = QPixmap.fromImage(qimg)
+
+            # Scale down to target size with smooth transformation
+            display_width = int(self.page_rect.width * scale)
+            display_height = int(self.page_rect.height * scale)
+
+            try:
+                # Qt5
+                self.original_pixmap = high_res_pixmap.scaled(
+                    display_width, display_height,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+            except AttributeError:
+                # Qt6
+                self.original_pixmap = high_res_pixmap.scaled(
+                    display_width, display_height,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation
+                )
+
+            self.base_pixmap = self.original_pixmap.copy()
+
+            # Calculate scale factor (display pixels per PDF point)
+            # This is the scale we calculated, not from the high-res render
+            self.base_scale_factor = scale
+
+            # Store page and doc reference for re-rendering at different zooms
+            self.fitz_page = page
+            self.fitz_doc = doc
+            self.base_scale = scale
+
+            # Initialize the display properly (without any selection overlay)
+            self.image_label.setPixmap(self.base_pixmap)
+            self.image_label.resize(self.base_pixmap.size())
+
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Error", f"Failed to load PDF preview: {e}")
+            self.reject()
+
+    def closeEvent(self, event):
+        """Clean up fitz document when dialog closes."""
+        if hasattr(self, 'fitz_doc') and self.fitz_doc:
+            try:
+                self.fitz_doc.close()
+            except:
+                pass
+        super().closeEvent(event)
+
+    def showEvent(self, event):
+        """Initialize display when dialog is shown, preserving existing crop selection."""
+        super().showEvent(event)
+        # Don't clear crop_rect - preserve it if it exists
+        # Clear interactive selection state
+        self.start_point = None
+        self.current_point = None
+        self.selecting = False
+        # Reset zoom to default
+        self.zoom_level = 1.0
+
+        # If there's an existing crop_rect, convert it to screen coordinates and display
+        if self.crop_rect and self.base_pixmap:
+            # Convert PDF coordinates to screen coordinates
+            x1 = self.crop_rect.x0 * self.base_scale_factor
+            y1 = self.crop_rect.y0 * self.base_scale_factor
+            x2 = self.crop_rect.x1 * self.base_scale_factor
+            y2 = self.crop_rect.y1 * self.base_scale_factor
+
+            # Set the points for display
+            self.start_point = QPoint(int(x1), int(y1))
+            self.current_point = QPoint(int(x2), int(y2))
+
+            self._update_display()
+        elif self.base_pixmap:
+            # No existing crop, just refresh display
+            self._update_display()
+
+    def _widget_to_pixmap_coords(self, widget_pos):
+        """Convert widget coordinates to pixmap coordinates."""
+        if not self.base_pixmap:
+            return None
+
+        # Since we're using setWidgetResizable(False), the widget size equals pixmap size
+        # Just clamp to bounds
+        pixmap_x = max(0, min(widget_pos.x(), self.base_pixmap.width()))
+        pixmap_y = max(0, min(widget_pos.y(), self.base_pixmap.height()))
+
+        return QPoint(int(pixmap_x), int(pixmap_y))
+
+    def _on_mouse_press(self, event):
+        """Start selection."""
+        try:
+            # Qt6
+            pos = event.position().toPoint()
+        except AttributeError:
+            # Qt5
+            pos = event.pos()
+
+        # Convert to pixmap coordinates
+        pixmap_pos = self._widget_to_pixmap_coords(pos)
+        if pixmap_pos is None:
+            return
+
+        self.selecting = True
+        self.start_point = pixmap_pos
+        self.current_point = pixmap_pos
+
+    def _on_mouse_move(self, event):
+        """Update selection."""
+        if not self.selecting:
+            return
+
+        try:
+            # Qt6
+            pos = event.position().toPoint()
+        except AttributeError:
+            # Qt5
+            pos = event.pos()
+
+        # Convert to pixmap coordinates
+        pixmap_pos = self._widget_to_pixmap_coords(pos)
+        if pixmap_pos is None:
+            return
+
+        self.current_point = pixmap_pos
+        self._update_display()
+
+    def _on_mouse_release(self, event):
+        """Finish selection."""
+        if not self.selecting:
+            return
+
+        try:
+            # Qt6
+            pos = event.position().toPoint()
+        except AttributeError:
+            # Qt5
+            pos = event.pos()
+
+        # Convert to pixmap coordinates
+        pixmap_pos = self._widget_to_pixmap_coords(pos)
+        if pixmap_pos is None:
+            return
+
+        self.current_point = pixmap_pos
+        self.selecting = False
+        self._finalize_selection()
+        self._update_display()
+
+    def _finalize_selection(self):
+        """Convert screen coordinates to PDF coordinates."""
+        if self.start_point is None or self.current_point is None:
+            return
+
+        # Get screen rectangle
+        x1 = min(self.start_point.x(), self.current_point.x())
+        y1 = min(self.start_point.y(), self.current_point.y())
+        x2 = max(self.start_point.x(), self.current_point.x())
+        y2 = max(self.start_point.y(), self.current_point.y())
+
+        # Convert to PDF coordinates (account for zoom)
+        # The display scale is base_scale_factor * zoom_level
+        display_scale = self.base_scale_factor * self.zoom_level
+        pdf_x1 = x1 / display_scale
+        pdf_y1 = y1 / display_scale
+        pdf_x2 = x2 / display_scale
+        pdf_y2 = y2 / display_scale
+
+        # Create fitz.Rect
+        if fitz:
+            self.crop_rect = fitz.Rect(pdf_x1, pdf_y1, pdf_x2, pdf_y2)
+
+    def _prev_page(self):
+        """Navigate to previous page."""
+        if self.current_page > 0:
+            self._load_pdf_preview(self.current_page - 1)
+            # Clear selection when changing pages
+            self._clear_selection()
+
+    def _next_page(self):
+        """Navigate to next page."""
+        if self.current_page < self.total_pages - 1:
+            self._load_pdf_preview(self.current_page + 1)
+            # Clear selection when changing pages
+            self._clear_selection()
+
+    def _zoom_in(self):
+        """Zoom in by 25%."""
+        self.zoom_level = min(self.zoom_level * 1.25, 5.0)  # Max 500%
+        self._apply_zoom()
+
+    def _zoom_out(self):
+        """Zoom out by 25%."""
+        self.zoom_level = max(self.zoom_level / 1.25, 0.25)  # Min 25%
+        self._apply_zoom()
+
+    def _zoom_fit(self):
+        """Reset zoom to fit window."""
+        self.zoom_level = 1.0
+        self._apply_zoom()
+
+    def _apply_zoom(self):
+        """Apply current zoom level to the displayed image."""
+        if not self.original_pixmap:
+            return
+
+        # Scale the original pixmap
+        new_width = int(self.original_pixmap.width() * self.zoom_level)
+        new_height = int(self.original_pixmap.height() * self.zoom_level)
+
+        try:
+            # Qt5
+            self.base_pixmap = self.original_pixmap.scaled(
+                new_width, new_height,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+        except AttributeError:
+            # Qt6
+            self.base_pixmap = self.original_pixmap.scaled(
+                new_width, new_height,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+
+        # Update zoom label
+        self.lbl_zoom.setText(f"{int(self.zoom_level * 100)}%")
+
+        # Clear selection when zooming
+        self.start_point = None
+        self.current_point = None
+        self.selecting = False
+
+        # Update display
+        self.image_label.setPixmap(self.base_pixmap)
+        self.image_label.resize(self.base_pixmap.size())
+
+    def _clear_selection(self):
+        """Clear the current selection."""
+        self.start_point = None
+        self.current_point = None
+        self.crop_rect = None
+        self.selecting = False
+        self._update_display()
+
+    def _update_display(self):
+        """Redraw the image with selection overlay."""
+        if self.base_pixmap is None:
+            return
+
+        # Create a copy of the base pixmap
+        display_pixmap = QPixmap(self.base_pixmap)
+
+        # Draw selection rectangle if active
+        if self.start_point and self.current_point:
+            painter = QPainter(display_pixmap)
+
+            # Draw semi-transparent overlay
+            painter.setPen(QPen(QColor(0, 120, 212), 2))
+            painter.setBrush(QColor(0, 120, 212, 30))
+
+            x1 = min(self.start_point.x(), self.current_point.x())
+            y1 = min(self.start_point.y(), self.current_point.y())
+            width = abs(self.current_point.x() - self.start_point.x())
+            height = abs(self.current_point.y() - self.start_point.y())
+
+            painter.drawRect(x1, y1, width, height)
+            painter.end()
+
+        self.image_label.setPixmap(display_pixmap)
+
+    def get_crop_rect(self):
+        """Return the selected crop rectangle in PDF coordinates (fitz.Rect)."""
+        return self.crop_rect
+
+
+# =========================================================
 # BACKGROUND TASK
 # =========================================================
 class PdfToVectorTask(QgsTask):
     def __init__(self, pdf_paths, out_dir, out_fmt, crs, canvas_extent,
                  page_from, page_to, include_geom, include_text,
-                 load_outputs, dialog_ref=None):
+                 load_outputs, crop_rect=None, dialog_ref=None):
 
         super().__init__("PDF → Vector Conversion", QgsTask.CanCancel)
         self.pdf_paths = pdf_paths if isinstance(
@@ -163,6 +765,7 @@ class PdfToVectorTask(QgsTask):
         self.include_geom = include_geom
         self.include_text = include_text
         self.load_outputs = load_outputs
+        self.crop_rect = crop_rect  # fitz.Rect or None
         self.dialog_ref = dialog_ref
 
         self.generated = []
@@ -232,7 +835,8 @@ class PdfToVectorTask(QgsTask):
                     if self.out_fmt == "dxf":
                         dxf_out = os.path.join(
                             self.out_dir, f"{base}_p{page_num}.dxf")
-                        ok, msg = convert_pdf_page_to_dxf_direct(page, dxf_out)
+                        ok, msg = convert_pdf_page_to_dxf_direct(
+                            page, dxf_out, self.crop_rect)
                         if ok:
                             self.generated.append(
                                 (dxf_out, f"{base} Page {page_num}", "dxf"))
@@ -303,6 +907,15 @@ class PdfToVectorTask(QgsTask):
         drawings = page.get_drawings() or []
         fid = 0
         for d in drawings:
+            # Check if drawing intersects with crop region (not full containment)
+            if self.crop_rect:
+                d_rect = d.get("rect")
+                if d_rect:
+                    # Check if drawing intersects the crop region
+                    if not (d_rect.x0 <= self.crop_rect.x1 and d_rect.x1 >= self.crop_rect.x0 and
+                            d_rect.y0 <= self.crop_rect.y1 and d_rect.y1 >= self.crop_rect.y0):
+                        continue  # Skip drawings that don't intersect crop region
+
             for item in d.get("items", []):
                 try:
                     cmd = item[0]
@@ -316,8 +929,21 @@ class PdfToVectorTask(QgsTask):
                     if str(cmd).lower() == "l":
                         p1 = item[1]
                         p2 = item[2]
-                        x1, y1 = p1[0] + ox, page_h - p1[1] + oy
-                        x2, y2 = p2[0] + ox, page_h - p2[1] + oy
+
+                        # Apply clipping if crop region is set
+                        if self.crop_rect:
+                            clipped = clip_line_to_rect(
+                                p1[0], p1[1], p2[0], p2[1], self.crop_rect)
+                            if clipped is None:
+                                continue  # Line is completely outside crop region
+
+                            x1, y1, x2, y2 = clipped
+                            x1, y1 = x1 + ox, page_h - y1 + oy
+                            x2, y2 = x2 + ox, page_h - y2 + oy
+                        else:
+                            x1, y1 = p1[0] + ox, page_h - p1[1] + oy
+                            x2, y2 = p2[0] + ox, page_h - p2[1] + oy
+
                         geom = QgsGeometry.fromPolylineXY([
                             QgsPointXY(x1, y1),
                             QgsPointXY(x2, y2)
@@ -329,6 +955,18 @@ class PdfToVectorTask(QgsTask):
 
                     # CURVE (write polyline through control points)
                     elif str(cmd).lower() == "c":
+                        # For curves, check if all points are within crop region
+                        all_inside = True
+                        if self.crop_rect:
+                            for cpt in item[1:]:
+                                if not (self.crop_rect.x0 <= cpt[0] <= self.crop_rect.x1 and
+                                        self.crop_rect.y0 <= cpt[1] <= self.crop_rect.y1):
+                                    all_inside = False
+                                    break
+
+                        if not all_inside and self.crop_rect:
+                            continue  # Skip curves that extend outside crop region
+
                         pts = []
                         for cpt in item[1:]:
                             px = cpt[0] + ox
@@ -344,8 +982,16 @@ class PdfToVectorTask(QgsTask):
                     # RECTANGLE
                     elif str(cmd).lower() in ("re", "rect"):
                         rect = item[1]
+
+                        if self.crop_rect:
+                            # For rectangles, check if fully contained within crop
+                            if not (rect.x0 >= self.crop_rect.x0 and rect.x1 <= self.crop_rect.x1 and
+                                    rect.y0 >= self.crop_rect.y0 and rect.y1 <= self.crop_rect.y1):
+                                continue  # Skip rectangles not fully within crop
+
                         x0, y0 = rect.x0, rect.y0
                         x1, y1 = rect.x1, rect.y1
+
                         pts = [
                             QgsPointXY(x0 + ox, page_h - y0 + oy),
                             QgsPointXY(x1 + ox, page_h - y0 + oy),
@@ -393,7 +1039,11 @@ class PdfToVectorTask(QgsTask):
             oy = self.canvas_extent.center().y() - page_h / 2
 
         try:
-            info = page.get_text("dict")
+            if self.crop_rect:
+                # Use clip parameter to extract only text in crop region
+                info = page.get_text("dict", clip=self.crop_rect)
+            else:
+                info = page.get_text("dict")
         except Exception:
             info = {}
 
@@ -493,8 +1143,39 @@ class PdfToVectorDialog(QDialog):
         self.task_timer = QTimer()
         self.task_timer.setInterval(300)
         self.task_timer.timeout.connect(self._update_progress_safe)
+        self.crop_rect = None  # Stores the crop region (fitz.Rect or None)
 
         self._build_ui()
+
+    def showEvent(self, event):
+        """Reset dialog state when shown to ensure clean start."""
+        super().showEvent(event)
+        # Reset crop settings
+        self.crop_rect = None
+        if hasattr(self, 'lbl_crop_status'):
+            self.lbl_crop_status.setText("Crop: Full Page")
+        # Reset progress
+        if hasattr(self, 'progress'):
+            self.progress.setValue(0)
+        if hasattr(self, 'lbl_prog'):
+            self.lbl_prog.setText("Ready")
+
+    def closeEvent(self, event):
+        """Clean up when dialog is closed."""
+        # Stop any running tasks
+        if self.task:
+            try:
+                self.task.cancel()
+            except:
+                pass
+            self.task = None
+
+        # Stop the progress timer
+        if self.task_timer:
+            self.task_timer.stop()
+
+        # Accept the close event
+        super().closeEvent(event)
 
     # ----------------------------------------------------
     # UI CREATION
@@ -576,6 +1257,21 @@ class PdfToVectorDialog(QDialog):
         self.chk_load = QCheckBox("Load results into QGIS project")
         self.chk_load.setChecked(True)
         grp_options_layout.addWidget(self.chk_load)
+
+        # Crop region controls
+        crop_row = QHBoxLayout()
+        btn_crop = QPushButton("Set Crop Region...")
+        btn_crop.clicked.connect(self._set_crop_region)
+        btn_clear_crop = QPushButton("Clear Crop")
+        btn_clear_crop.clicked.connect(self._clear_crop_region)
+        btn_clear_crop.setMaximumWidth(100)
+        self.lbl_crop_status = QLabel("Crop: Full Page")
+        self.lbl_crop_status.setStyleSheet("color: #666666; font-size: 11px;")
+        crop_row.addWidget(btn_crop)
+        crop_row.addWidget(btn_clear_crop)
+        crop_row.addWidget(self.lbl_crop_status)
+        crop_row.addStretch()
+        grp_options_layout.addLayout(crop_row)
 
         grp_options.setLayout(grp_options_layout)
         layout_in.addWidget(grp_options)
@@ -740,9 +1436,18 @@ class PdfToVectorDialog(QDialog):
             files = dlg.selectedFiles()
 
             if files:
+                # Store old PDF to detect changes
+                old_pdf = self.pdf_edit.text().strip()
+
                 # Join with semicolon for display
                 joined_paths = "; ".join(files)
                 self.pdf_edit.setText(joined_paths)
+
+                # Reset crop if PDF changed
+                if old_pdf != joined_paths:
+                    self.crop_rect = None
+                    if hasattr(self, 'lbl_crop_status'):
+                        self.lbl_crop_status.setText("Crop: Full Page")
 
                 # Use the first file to set page counts
                 try:
@@ -772,6 +1477,55 @@ class PdfToVectorDialog(QDialog):
             allp = (state == Qt.Checked)
         self.spin_from.setEnabled(not allp)
         self.spin_to.setEnabled(not allp)
+
+    def _set_crop_region(self):
+        """Open crop region selection dialog."""
+        pdf_input = self.pdf_edit.text().strip()
+        if not pdf_input:
+            QMessageBox.warning(
+                self, "Error", "Please select a PDF file first")
+            return
+
+        # Get the first PDF file
+        pdf_files = [f.strip() for f in pdf_input.split(";") if f.strip()]
+        if not pdf_files:
+            QMessageBox.warning(self, "Error", "No PDF files selected")
+            return
+
+        first_pdf = pdf_files[0]
+        if not os.path.exists(first_pdf):
+            QMessageBox.warning(
+                self, "Error", f"PDF file not found: {first_pdf}")
+            return
+
+        # Open crop preview dialog
+        dlg = CropPreviewDialog(first_pdf, self.crop_rect, self)
+
+        # Qt5/Qt6 compatible exec
+        exec_func = dlg.exec if hasattr(dlg, 'exec') else dlg.exec_
+
+        # Qt5/Qt6 compatible Accepted constant
+        try:
+            accepted = QDialog.Accepted
+        except AttributeError:
+            accepted = QDialog.DialogCode.Accepted
+
+        if exec_func() == accepted:
+            self.crop_rect = dlg.get_crop_rect()
+            if self.crop_rect:
+                # Update status label
+                self.lbl_crop_status.setText(
+                    f"Crop: ({self.crop_rect.x0:.1f}, {self.crop_rect.y0:.1f}) - "
+                    f"({self.crop_rect.x1:.1f}, {self.crop_rect.y1:.1f})"
+                )
+            else:
+                self.crop_rect = None
+                self.lbl_crop_status.setText("Crop: Full Page")
+
+    def _clear_crop_region(self):
+        """Clear the crop region selection."""
+        self.crop_rect = None
+        self.lbl_crop_status.setText("Crop: Full Page")
 
     # ----------------------------------------------------
     # START TASK
@@ -848,6 +1602,7 @@ class PdfToVectorDialog(QDialog):
             include_geom=self.chk_geom.isChecked(),
             include_text=self.chk_text.isChecked(),
             load_outputs=self.chk_load.isChecked(),
+            crop_rect=self.crop_rect,
             dialog_ref=self
         )
         QgsApplication.taskManager().addTask(self.task)
