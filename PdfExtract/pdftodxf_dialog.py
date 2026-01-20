@@ -17,7 +17,7 @@ from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QFileDialog, QComboBox, QMessageBox, QTabWidget,
     QWidget, QCheckBox, QSpinBox, QGroupBox, QFormLayout, QProgressBar,
-    QFrame, QScrollArea
+    QFrame, QScrollArea, QDoubleSpinBox
 )
 from qgis.PyQt.QtCore import Qt, QTimer, QVariant, QRect, QPoint
 from qgis.PyQt.QtGui import QPixmap, QImage, QPainter, QPen, QColor
@@ -109,7 +109,7 @@ def clip_line_to_rect(x1, y1, x2, y2, rect):
             code2 = compute_code(x2, y2)
 
 
-def convert_pdf_page_to_dxf_direct(page, output_dxf_path, crop_rect=None):
+def convert_pdf_page_to_dxf_direct(page, output_dxf_path, crop_rect=None, min_size=0.0, skip_curves=False):
     """Convert PDF page directly to DXF using ezdxf (better quality)."""
     if ezdxf is None:
         return False, "ezdxf not installed"
@@ -136,11 +136,41 @@ def convert_pdf_page_to_dxf_direct(page, output_dxf_path, crop_rect=None):
                             path_rect.y0 <= crop_rect.y1 and path_rect.y1 >= crop_rect.y0):
                         continue  # Skip paths that don't intersect crop region
 
-            for item in path.get("items", []):
                 try:
                     cmd = item[0]
                     if isinstance(cmd, bytes):
                         cmd = cmd.decode("utf-8", "ignore")
+
+                    # Check size for filtering logic
+                    # Calculate bounding box of the item if possible or approximate size
+                    # For simple lines/curves we can check length or bounds
+                    pass_size_check = True
+                    if min_size > 0:
+                        # item structure depends on cmd
+                        # l, c, re/rect
+                        bbox_w = 0
+                        bbox_h = 0
+                        if str(cmd).lower() == "l":
+                            p1, p2 = item[1], item[2]
+                            bbox_w = abs(p1[0] - p2[0])
+                            bbox_h = abs(p1[1] - p2[1])
+                        elif str(cmd).lower() == "c":
+                            # bezier control points
+                            xs = [pt[0] for pt in item[1:] if pt]
+                            ys = [pt[1] for pt in item[1:] if pt]
+                            if xs and ys:
+                                bbox_w = max(xs) - min(xs)
+                                bbox_h = max(ys) - min(ys)
+                        elif str(cmd).lower() in ("re", "rect"):
+                            rect = item[1]
+                            bbox_w = rect.width
+                            bbox_h = rect.height
+
+                        if max(bbox_w, bbox_h) < min_size:
+                            pass_size_check = False
+
+                    if not pass_size_check:
+                        continue
 
                     # LINE
                     if str(cmd).lower() == "l":
@@ -169,6 +199,9 @@ def convert_pdf_page_to_dxf_direct(page, output_dxf_path, crop_rect=None):
 
                     # CURVE
                     elif str(cmd).lower() == "c":
+                        if skip_curves:
+                            continue
+
                         control_points = []
                         # For curves, check if all points are within crop region
                         all_inside = True
@@ -751,7 +784,8 @@ class CropPreviewDialog(QDialog):
 class PdfToVectorTask(QgsTask):
     def __init__(self, pdf_paths, out_dir, out_fmt, crs, canvas_extent,
                  page_from, page_to, include_geom, include_text,
-                 load_outputs, crop_rect=None, dialog_ref=None):
+                 load_outputs, crop_rect=None, dialog_ref=None,
+                 min_size=0.0, skip_curves=False):
 
         super().__init__("PDF → Vector Conversion", QgsTask.CanCancel)
         self.pdf_paths = pdf_paths if isinstance(
@@ -767,6 +801,8 @@ class PdfToVectorTask(QgsTask):
         self.load_outputs = load_outputs
         self.crop_rect = crop_rect  # fitz.Rect or None
         self.dialog_ref = dialog_ref
+        self.min_size = min_size
+        self.skip_curves = skip_curves
 
         self.generated = []
         self.error = None
@@ -836,7 +872,8 @@ class PdfToVectorTask(QgsTask):
                         dxf_out = os.path.join(
                             self.out_dir, f"{base}_p{page_num}.dxf")
                         ok, msg = convert_pdf_page_to_dxf_direct(
-                            page, dxf_out, self.crop_rect)
+                            page, dxf_out, self.crop_rect,
+                            min_size=self.min_size, skip_curves=self.skip_curves)
                         if ok:
                             self.generated.append(
                                 (dxf_out, f"{base} Page {page_num}", "dxf"))
@@ -847,6 +884,7 @@ class PdfToVectorTask(QgsTask):
                                 self._write_geometry(page, geom_path, driver)
                                 self.generated.append(
                                     (geom_path, f"{base} Page {page_num} Geometry", "geom"))
+
                             if self.include_text:
                                 self._write_text(page, text_path, driver)
                                 self.generated.append(
@@ -922,6 +960,32 @@ class PdfToVectorTask(QgsTask):
                     if isinstance(cmd, bytes):
                         cmd = cmd.decode("utf-8", "ignore")
 
+                    # Check size for filtering logic
+                    pass_size_check = True
+                    if self.min_size > 0:
+                        bbox_w = 0.0
+                        bbox_h = 0.0
+                        if str(cmd).lower() == "l":
+                            p1, p2 = item[1], item[2]
+                            bbox_w = abs(p1[0] - p2[0])
+                            bbox_h = abs(p1[1] - p2[1])
+                        elif str(cmd).lower() == "c":
+                            xs = [pt[0] for pt in item[1:] if pt]
+                            ys = [pt[1] for pt in item[1:] if pt]
+                            if xs and ys:
+                                bbox_w = max(xs) - min(xs)
+                                bbox_h = max(ys) - min(ys)
+                        elif str(cmd).lower() in ("re", "rect"):
+                            rect = item[1]
+                            bbox_w = rect.width
+                            bbox_h = rect.height
+
+                        if max(bbox_w, bbox_h) < self.min_size:
+                            pass_size_check = False
+
+                    if not pass_size_check:
+                        continue
+
                     feat = QgsFeature(fields)
                     feat.setAttribute("id", fid)
 
@@ -955,6 +1019,9 @@ class PdfToVectorTask(QgsTask):
 
                     # CURVE (write polyline through control points)
                     elif str(cmd).lower() == "c":
+                        if self.skip_curves:
+                            continue
+
                         # For curves, check if all points are within crop region
                         all_inside = True
                         if self.crop_rect:
@@ -1331,6 +1398,32 @@ class PdfToVectorDialog(QDialog):
         grp_inc.setLayout(grp_inc_layout)
         layout_adv.addWidget(grp_inc)
 
+        # Filters
+        grp_filters = QGroupBox("Filter Geometries")
+        grp_filters_layout = QVBoxLayout()
+        grp_filters_layout.setSpacing(6)
+
+        self.chk_skip_curves = QCheckBox(
+            "Skip Curved Geometries (Bezier/Splines)")
+        grp_filters_layout.addWidget(self.chk_skip_curves)
+
+        row_size = QHBoxLayout()
+        row_size.addWidget(QLabel("Minimum Size (points):"))
+        self.spin_min_size = QDoubleSpinBox()
+        self.spin_min_size.setMinimum(0.0)
+        self.spin_min_size.setMaximum(99999.0)
+        self.spin_min_size.setDecimals(1)
+        self.spin_min_size.setSingleStep(1.0)
+        self.spin_min_size.setValue(0.0)
+        self.spin_min_size.setToolTip(
+            "Skip geometries where max side is smaller than this value")
+        row_size.addWidget(self.spin_min_size)
+        row_size.addStretch()
+
+        grp_filters_layout.addLayout(row_size)
+        grp_filters.setLayout(grp_filters_layout)
+        layout_adv.addWidget(grp_filters)
+
         layout_adv.addStretch()
         tab_adv.setLayout(layout_adv)
         tabs.addTab(tab_adv, "Advanced")
@@ -1603,7 +1696,9 @@ class PdfToVectorDialog(QDialog):
             include_text=self.chk_text.isChecked(),
             load_outputs=self.chk_load.isChecked(),
             crop_rect=self.crop_rect,
-            dialog_ref=self
+            dialog_ref=self,
+            min_size=self.spin_min_size.value(),
+            skip_curves=self.chk_skip_curves.isChecked()
         )
         QgsApplication.taskManager().addTask(self.task)
 
@@ -1611,17 +1706,11 @@ class PdfToVectorDialog(QDialog):
         self.lbl_prog.setText("0%")
         self.task_timer.start()
 
-    # ----------------------------------------------------
-    # CANCEL TASK
-    # ----------------------------------------------------
     def _cancel(self):
+        """Cancel the running task."""
         if self.task:
             self.task.cancel()
-            self.lbl_prog.setText("Cancelling...")
-
-    # ----------------------------------------------------
-    # SAFE PROGRESS UPDATE (patched)
-    # ----------------------------------------------------
+        self.lbl_prog.setText("Cancelling...")
 
     def _update_progress_safe(self):
         """Safely update progress without touching deleted QObject."""
@@ -1687,7 +1776,6 @@ class PdfToVectorDialog(QDialog):
             self.lbl_prog.setText("Ready")
         else:
             QMessageBox.critical(self, "Error", message)
-
 
 # =========================================================
 # SHOW DIALOG

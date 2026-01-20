@@ -67,6 +67,9 @@ The plugin relies on two Python libraries, which are **automatically installed**
       - **Geometry**: Extracts vector shapes such as lines, curves, and rectangles from the PDF.
       - **Text**: Extracts text elements including labels and annotations.
       - **Both**: Extracts both geometry and text for comprehensive conversion.
+    - **Filter Geometries**:
+      - **Skip Curved Geometries**: Option to exclude Bezier curves and splines from the output, useful for clean linear extractions.
+      - **Minimum Size**: Set a threshold (in points) to ignore small geometries like dust or minor artifacts.
 
 4. Click **Convert** ▶️ to start processing.
     - The progress bar displays the current status.
@@ -83,6 +86,8 @@ The plugin relies on two Python libraries, which are **automatically installed**
     - Output format (Shapefile or GeoJSON or DXF).
     - Output base path.
     - Option to load output into the project.
+    - **Skip Curved Geometries**: Boolean to exclude curves.
+    - **Minimum Size**: Numeric threshold to filter small objects.
 
 4. Run the algorithm to process the PDF and generate vector output layers.
 
