@@ -67,7 +67,10 @@ else:
     page_from = 1
     page_to = 99999
 
-crop_rect = None
+if "crop_rect" not in st.session_state:
+    st.session_state.crop_rect = None
+
+crop_rect = st.session_state.crop_rect
 
 if uploaded_files:
     st.markdown("### Preview & Crop")
@@ -110,11 +113,15 @@ if uploaded_files:
                 w = obj["width"] * obj["scaleX"]
                 h = obj["height"] * obj["scaleY"]
                 
+                # Handle negative widths/heights (when dragged bottom-right to top-left)
+                x1, x2 = min(x, x + w), max(x, x + w)
+                y1, y2 = min(y, y + h), max(y, y + h)
+                
                 # Clamp coordinates to page boundaries
-                crop_left = max(0.0, x / display_scale)
-                crop_top = max(0.0, y / display_scale)
-                crop_right = min(float(page_w), (x + w) / display_scale)
-                crop_bottom = min(float(page_h), (y + h) / display_scale)
+                crop_left = max(0.0, x1 / display_scale)
+                crop_top = max(0.0, y1 / display_scale)
+                crop_right = min(float(page_w), x2 / display_scale)
+                crop_bottom = min(float(page_h), y2 / display_scale)
                 
                 if crop_left < crop_right and crop_top < crop_bottom:
                     crop_rect = (crop_left, crop_top, crop_right, crop_bottom)
@@ -122,6 +129,8 @@ if uploaded_files:
                     crop_rect = None
             else:
                 crop_rect = None
+                
+            st.session_state.crop_rect = crop_rect
 
         else:
             if enable_crop and st_canvas is None:
@@ -139,6 +148,8 @@ if uploaded_files:
                 else:
                     st.warning("Invalid crop region. Left must be < Right, Top must be < Bottom.")
                     crop_rect = None
+                    
+            st.session_state.crop_rect = crop_rect
 
             # Render image statically (fallback or no crop)
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)

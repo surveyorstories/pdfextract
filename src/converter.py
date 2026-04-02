@@ -191,19 +191,20 @@ class PDF2DXFConverter:
                         self.msp.add_spline(control_points, degree=3, dxfattribs={'layer': 'PDF_GEOMETRY'})
                     elif cmd == "re": # Rectangle
                         rect = item[1]
-                        if crop_rect:
-                            if not (rect.x0 >= crop_rect.x0 and rect.x1 <= crop_rect.x1 and
-                                    rect.y0 >= crop_rect.y0 and rect.y1 <= crop_rect.y1):
-                                continue
+                         vert rectangle to 4 clippable lines so crossing borders are correctly cropped
+                        lines = [(p1, p2), (p2, p3), (p3, p4), (p4, p1)]
+                        for pt1, pt2 in lines:
+                            if crop_rect:        clipped = clip_line_to_rect(pt1[0], pt1[1], pt2[0], pt2[1], crop_rect)
                         
-                        p1 = (rect.x0, rect.y0)
-                        p2 = (rect.x1, rect.y0)
-                        p3 = (rect.x1, rect.y1)
-                        p4 = (rect.x0, rect.y1)
-                        
-                        points = [p1, p2, p3, p4, p1] # Closed loop
-                        dxf_points = [self._transform_point(p, x_offset, page_height) for p in points]
-                        self.msp.add_lwpolyline(dxf_points, dxfattribs={'layer': 'PDF_GEOMETRY'})
+                                c_p2 = (clipped[2], clipped[3])
+                            else:
+                                c_p1, c_p2 = pt1, pt2
+                                
+                            self.msp.add_line(
+                                self._transform_point(c_p1, x_offset, page_height),
+                                self._transform_point(c_p2, x_offset, page_height),
+                                dxfattribs={'layer': 'PDF_GEOMETRY'}
+                            )
 
         # 2. Extract Text
         if include_text:
