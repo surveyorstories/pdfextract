@@ -109,7 +109,17 @@ if uploaded_files:
                 y = obj["top"]
                 w = obj["width"] * obj["scaleX"]
                 h = obj["height"] * obj["scaleY"]
-                crop_rect = (x / display_scale, y / display_scale, (x + w) / display_scale, (y + h) / display_scale)
+                
+                # Clamp coordinates to page boundaries
+                crop_left = max(0.0, x / display_scale)
+                crop_top = max(0.0, y / display_scale)
+                crop_right = min(float(page_w), (x + w) / display_scale)
+                crop_bottom = min(float(page_h), (y + h) / display_scale)
+                
+                if crop_left < crop_right and crop_top < crop_bottom:
+                    crop_rect = (crop_left, crop_top, crop_right, crop_bottom)
+                else:
+                    crop_rect = None
             else:
                 crop_rect = None
 
