@@ -191,11 +191,19 @@ class PDF2DXFConverter:
                         self.msp.add_spline(control_points, degree=3, dxfattribs={'layer': 'PDF_GEOMETRY'})
                     elif cmd == "re": # Rectangle
                         rect = item[1]
-                         vert rectangle to 4 clippable lines so crossing borders are correctly cropped
+                        p1 = (rect.x0, rect.y0)
+                        p2 = (rect.x1, rect.y0)
+                        p3 = (rect.x1, rect.y1)
+                        p4 = (rect.x0, rect.y1)
+                        
+                        # Convert rectangle to 4 clippable lines so crossing borders are correctly cropped
                         lines = [(p1, p2), (p2, p3), (p3, p4), (p4, p1)]
                         for pt1, pt2 in lines:
-                            if crop_rect:        clipped = clip_line_to_rect(pt1[0], pt1[1], pt2[0], pt2[1], crop_rect)
-                        
+                            if crop_rect:
+                                clipped = clip_line_to_rect(pt1[0], pt1[1], pt2[0], pt2[1], crop_rect)
+                                if clipped is None:
+                                    continue
+                                c_p1 = (clipped[0], clipped[1])
                                 c_p2 = (clipped[2], clipped[3])
                             else:
                                 c_p1, c_p2 = pt1, pt2
