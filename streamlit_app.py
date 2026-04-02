@@ -82,31 +82,7 @@ if uploaded_files:
         page_w, page_h = page.rect.width, page.rect.height
         
         enable_crop = st.checkbox("Enable Crop Region")
-        if enable_crop:
-            col1, col2 = st.columns(2)
-            with col1:
-                crop_left = st.slider("Left Margin", 0.0, float(page_w), 0.0)
-                crop_right = st.slider("Right Margin", 0.0, float(page_w), float(page_w))
-            with col2:
-                crop_top = st.slider("Top Margin", 0.0, float(page_h), 0.0)
-                crop_bottom = st.slider("Bottom Margin", 0.0, float(page_h), float(page_h))
-                
-            if crop_left < crop_right and crop_top < crop_bottom:
-                crop_rect = (crop_left, crop_top, crop_right, crop_bottom)
-            else:
-                st.warning("Invalid crop region. Left must be < Right, Top must be < Bottom.")
-                crop_rect = None
         
-        # Render image
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        
-        if crop_rect:
-            draw = ImageDraw.Draw(img, "RGBA")
-            scale = 2.0
-            draw.rectangle(
-                [crop_rect[0]*scale, crop_rect[1]*scale, crop_rect[2]*scale, crop_rect[3]*scale],
-                outline=(255, 0, 0, 255), width=4, fill=(255, 0, 0, 40)
         if enable_crop and st_canvas is not None:
             st.info("Draw a rectangle on the image below to set the crop region. Only the last drawn rectangle will be used.")
             
@@ -127,7 +103,6 @@ if uploaded_files:
                 key="crop_canvas",
             )
             
-        st.image(img, use_container_width=True)
             if canvas_result.json_data is not None and len(canvas_result.json_data["objects"]) > 0:
                 obj = canvas_result.json_data["objects"][-1]
                 x = obj["left"]
